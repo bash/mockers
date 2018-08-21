@@ -1,27 +1,31 @@
 //#![feature(proc_macro)]
 
 extern crate proc_macro;
+extern crate proc_macro2;
+#[macro_use]
 extern crate syn;
 #[macro_use]
 extern crate quote;
 extern crate itertools;
-#[macro_use] extern crate lazy_static;
-#[macro_use] extern crate synom;
+// #[macro_use] extern crate lazy_static;
+#[macro_use]
+extern crate synom;
 
 use std::result::Result;
-use std::sync::Mutex;
+// use std::sync::Mutex;
 use std::collections::{HashSet, HashMap};
-use proc_macro::TokenStream;
-use syn::{Item, ItemKind, Ident, Path, TraitItem, Unsafety, TyParamBound, TraitBoundModifier,
-          PathParameters, PathSegment, TraitItemKind, Ty, Generics, TyParam, Constness,
-          AngleBracketedParameterData, FnDecl, ImplItem, Defaultness, Visibility, ImplItemKind,
-          Expr, ExprKind, TypeBinding, FnArg, FunctionRetTy, Pat, BindingMode, Mutability,
-          QSelf, BareFnTy, MutTy, ParenthesizedParameterData, PolyTraitRef, BareFnArg,
-          ForeignItemKind};
-
+use proc_macro2::TokenStream;
+use syn::{Item, ItemTrait, ItemForeignMod, ForeignItem, ForeignItemFn, Ident, Path, TraitItem, TypeParamBound, TraitBoundModifier,
+          PathArguments, PathSegment, TraitItemType, Type, Generics, TypeParam, GenericParam,
+          AngleBracketedGenericArguments, FnDecl, ImplItem, Visibility, GenericArgument, TypeReference,
+          Expr, FnArg, ReturnType, Pat, TraitItemMethod, ArgCaptured, PatIdent, TypePtr, TypePath, TypeTuple,
+          QSelf, TypeBareFn, ParenthesizedGenericArguments, TraitBound, BareFnArg, ImplItemType, ExprPath, Attribute};
+use syn::punctuated::Punctuated;
+use syn::buffer::TokenBuffer;
 use std::str::FromStr;
 use quote::ToTokens;
 use itertools::Itertools;
+use proc_macro2::Span;
 
 /// Each mock struct generated with `#[derive(Mock)]` or `mock!` gets
 /// unique type ID. It is added to both call matchers produced by
@@ -30,9 +34,10 @@ use itertools::Itertools;
 /// both mock type ID and method name match.
 static mut NEXT_MOCK_TYPE_ID: usize = 0;
 
+/* TODO: enable again
 lazy_static! {
-    static ref KNOWN_TRAITS: Mutex<HashMap<Path, Item>> = Mutex::new(HashMap::new());
-}
+    static ref KNOWN_TRAITS: Mutex<HashMap<Path, ItemTrait>> = Mutex::new(HashMap::new());
+}*/
 
 struct MockAttrOptions {
     mock_name: Option<Ident>,
@@ -40,59 +45,73 @@ struct MockAttrOptions {
     refs: HashMap<Path, Path>,
 }
 
-fn parse_options(attr_tokens: TokenStream) -> Result<MockAttrOptions, String> {
-    use syn::{MetaItem, NestedMetaItem};
+fn parse_options(attr_tokens: proc_macro::TokenStream) -> Result<MockAttrOptions, String> {
+    use syn::{Meta, NestedMeta, MetaList, MetaNameValue, LitStr};
 
-    let attr = syn::parse_outer_attr(&format!("#[mocked({})]", attr_tokens)).expect("parsed");
-    assert!(attr.style == syn::AttrStyle::Outer);
+    let buffer = TokenBuffer::new(proc_macro::TokenStream::from_str(&format!("#[mocked({})]", attr_tokens)).unwrap());
+    let (attr, _) = Attribute::parse_outer(buffer.begin()).expect("parsed");
 
     let mut mock_name: Option<Ident> = None;
     let mut module_path: Option<Path> = None;
     let mut refs: HashMap<Path, Path> = HashMap::new();
 
-    match attr.value {
+    match attr.interpret_meta().expect("unable to interpret attribute meta") {
         // Just plain `#[mocked]` without parameters.
-        MetaItem::Word(..) => (),
+        Meta::Word(..) => (),
 
         // `#[mocked(module="...", inherits(...))]`
-        MetaItem::List(_, ref items) => {
-            for item in items {
+        Meta::List(MetaList { ref nested, .. }) => {
+            for item in nested {
                 match *item {
-                    NestedMetaItem::MetaItem(MetaItem::NameValue(ref name, syn::Lit::Str(ref refs_str, _))) if name == "refs" => {
-                        use syn::parse::path;
+                    NestedMeta::Meta(Meta::NameValue(MetaNameValue {ref ident, lit: syn::Lit::Str(ref refs_str), ..}))
+                    if &ident.to_string() == "refs" => {
+                        use syn::synom::{Synom, PResult};
+                        use syn::buffer::Cursor;
+
+                        fn parse_path(i: &str) -> synom::IResult<&'static str, Path> {
+                            let buf = TokenBuffer::new2(TokenStream::from_str(i).unwrap());
+                            
+                            match Path::parse(buf.begin()) {
+                                Ok((o, _)) => synom::IResult::Done("", o),
+                                Err(_) => synom::IResult::Error,
+                            }
+                        }
+
                         named!(refs_parser -> Vec<(Path, Path)>,
                             terminated_list!(punct!(","), do_parse!(
-                                source: path >>
+                                source: parse_path >>
                                 punct!("=>") >>
-                                target: path >>
+                                target: parse_path >>
                                 ((source, target))
                             ))
                         );
-                        let refs_list = unwrap("`refs` attr parameter", refs_parser, refs_str)?;
+                        let refs_list = unwrap("`refs` attr parameter", refs_parser, &refs_str.value())?;
 
                         for (source, target) in refs_list {
-                            if source.global {
+                            if source.global() {
                                 return Err("global source path".to_string());
                             }
-                            if !target.global {
+                            if !target.global() {
                                 return Err("local target path".to_string());
                             }
                             refs.insert(source, target);
                         }
                     }
 
-                    NestedMetaItem::MetaItem(MetaItem::NameValue(ref name, syn::Lit::Str(ref path_str, _))) if name == "module" => {
+                    NestedMeta::Meta(Meta::NameValue(MetaNameValue {ref ident, lit: syn::Lit::Str(ref path_str), ..}))
+                        if &ident.to_string() == "module" => {
+                        use syn::synom::Synom;
                         if module_path.is_some() {
                             return Err("module attribute parameters is used more than once".to_string());
                         }
-                        let path = syn::parse_path(&path_str)?;
-                        if !path.global {
+                        let path: Path = path_str.parse().map_err(|err| format!("{}", err))?;
+                        if !path.global() {
                             return Err("module path must be global".to_string());
                         }
                         module_path = Some(path);
                     },
 
-                    NestedMetaItem::MetaItem(MetaItem::Word(ref ident)) => {
+                    NestedMeta::Meta(Meta::Word(ref ident)) => {
                         mock_name = Some(ident.clone());
                     },
 
@@ -103,33 +122,37 @@ fn parse_options(attr_tokens: TokenStream) -> Result<MockAttrOptions, String> {
 
         // #[mocked="..."], such form isn't used right now, but may be used for specifying
         // mock struct name.
-        MetaItem::NameValue(_, _) => return Err(format!("unexpected name-value attribute param")),
+        Meta::NameValue(_) => return Err(format!("unexpected name-value attribute param")),
     }
 
     Ok(MockAttrOptions { mock_name, module_path, refs })
 }
 
 #[proc_macro_attribute]
-pub fn mocked(attr: TokenStream, input: TokenStream) -> TokenStream {
+pub fn mocked(attr: proc_macro::TokenStream, input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     derive_mock(attr, input)
 }
 
 // To be deprecated
 #[proc_macro_attribute]
-pub fn derive_mock(attr: TokenStream, input: TokenStream) -> TokenStream {
+pub fn derive_mock(attr: proc_macro::TokenStream, input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let opts = match parse_options(attr) {
         Ok(opts) => opts,
         Err(err) => panic!("{}", err),
     };
-    match mocked_impl(input, &opts) {
-        Ok(tokens) => tokens,
+    match mocked_impl(input.into(), &opts) {
+        Ok(tokens) => tokens.into(),
         Err(err) => panic!("{}", err),
     }
 }
 
 fn mocked_impl(input: TokenStream, opts: &MockAttrOptions) -> Result<TokenStream, String> {
+    use syn::synom::Synom;
+    use syn::buffer::TokenBuffer;
+
     let mut source = input.to_string();
-    let source_item = syn::parse_item(&source)?;
+    let buffer = TokenBuffer::new(input.into());
+    let (source_item, _) = Item::parse(buffer.begin()).map_err(|e| format!("{:?}", e))?;
     let (tokens, include_source) = generate_mock(&source_item, opts)?;
 
     if cfg!(feature="debug") {
@@ -139,7 +162,7 @@ fn mocked_impl(input: TokenStream, opts: &MockAttrOptions) -> Result<TokenStream
     if !include_source {
         source.clear();
     }
-    source.push_str(tokens.as_str());
+    source.push_str(&tokens.to_string());
     TokenStream::from_str(&source).map_err(|e| format!("{:?}", e))
 }
 
@@ -148,27 +171,26 @@ struct TraitDesc {
     trait_item: Item,
 }
 
-fn generate_mock(item: &Item, opts: &MockAttrOptions) -> Result<(quote::Tokens, bool), String> {
-    let bounds = match item.node {
-        ItemKind::Trait(ref _unsafety, ref _generics, ref bounds, ref _subitems) => bounds,
-        ItemKind::ForeignMod(ref foreign_mod) => {
+fn generate_mock(item: &Item, opts: &MockAttrOptions) -> Result<(TokenStream, bool), String> {
+    let (supertraits, ident) = match item {
+        Item::Trait(ItemTrait { ref supertraits, ref ident, .. }) => (supertraits, ident),
+        Item::ForeignMod(ref foreign_mod) => {
             let mock_name = opts.mock_name.as_ref().ok_or_else(||
                 "mock type name must be set explicitly for extern block".to_string())?;
             return Ok((generate_extern_mock(foreign_mod, mock_name)?, false))
         },
         _ => return Err("Attribute may be used on traits and extern blocks only".to_string()),
     };
-    let mock_ident = opts.mock_name.clone().unwrap_or_else(|| Ident::new(format!("{}Mock", item.ident)));
+    let mock_ident = opts.mock_name.clone().unwrap_or_else(|| Ident::new(&format!("{}Mock", ident), Span::call_site()));
 
     // Find definitions for referenced traits.
-    let referenced_items = bounds.iter().map(|b| {
+    let referenced_items = supertraits.iter().map(|b| {
         let path = match *b {
-            TyParamBound::Region(..) =>
+            TypeParamBound::Lifetime(..) =>
                 return Err("lifetime parameters not supported yet".to_string()),
-            TyParamBound::Trait(PolyTraitRef { ref trait_ref, .. }, _modifier) =>
-                trait_ref,
+            TypeParamBound::Trait(TraitBound { ref path, .. }) => path,
         };
-        let full_path = if path.global {
+        let full_path = if path.global() {
             path
         } else {
             match opts.refs.get(path) {
@@ -176,6 +198,8 @@ fn generate_mock(item: &Item, opts: &MockAttrOptions) -> Result<(quote::Tokens, 
                 None => return Err("parent trait path must be given using 'refs' param".to_string()),
             }
         };
+        /*
+        TODO: enable again 
         if let Some(referenced_trait) = KNOWN_TRAITS.lock().unwrap().get(full_path) {
             let mod_path = Path {
                 global: path.global,
@@ -183,30 +207,31 @@ fn generate_mock(item: &Item, opts: &MockAttrOptions) -> Result<(quote::Tokens, 
             };
             Ok(TraitDesc {
                 mod_path: mod_path,
-                trait_item: referenced_trait.clone(),
+                trait_item: Item::Trait(referenced_trait.clone()),
             })
-        } else {
+        } else {*/
             Err(format!("Can't resolve trait reference: {:?}", path))
-        }
+        /*}*/
     }).collect::<Result<Vec<TraitDesc>, String>>()?;
 
     // Remember full trait definition, so we can recall it when it is references by
     // another trait.
     if let Some(ref module_path) = opts.module_path {
         let mut full_path = module_path.clone();
-        full_path.segments.push(PathSegment::from(item.ident.clone()));
-        KNOWN_TRAITS.lock().unwrap().insert(full_path, item.clone());
+        full_path.segments.push(PathSegment::from(ident.clone()));
+        /* TODO: enable again KNOWN_TRAITS.lock().unwrap().insert(full_path, item.clone()); */
     }
 
     let trait_desc = TraitDesc {
         mod_path: Path {
-            global: false,
-            segments: vec![],
+            leading_colon: None,
+            segments: Punctuated::new(),
         },
         trait_item: item.clone(),
     };
     let mut all_traits = referenced_items;
     all_traits.push(trait_desc);
+
     Ok((generate_mock_for_traits(mock_ident, &all_traits, true)?, true))
 }
 
@@ -217,30 +242,28 @@ fn generate_mock(item: &Item, opts: &MockAttrOptions) -> Result<(quote::Tokens, 
 fn generate_mock_for_traits(mock_ident: Ident,
                             trait_items: &[TraitDesc],
                             local: bool)
-                            -> Result<quote::Tokens, String> {
+                            -> Result<TokenStream, String> {
     let mock_ident_ref = &mock_ident;
     // Validate items, reject unsupported ones.
     let mut trait_paths = HashSet::<String>::new();
     let traits: Vec<(Path, &Vec<TraitItem>)> = trait_items.iter()
         .map(|desc| {
-            match desc.trait_item.node {
-                ItemKind::Trait(unsafety, ref generics, ref param_bounds, ref subitems) => {
-                    if unsafety != Unsafety::Normal {
+            match desc.trait_item {
+                Item::Trait(ItemTrait { ref unsafety, ref generics, ref supertraits, ref items, ref ident, .. }) => {
+                    if unsafety.is_some() {
                         return Err("Unsafe traits are not supported yet".to_string());
                     }
 
-                    if !generics.lifetimes.is_empty() || !generics.ty_params.is_empty() ||
-                       !generics.where_clause.predicates.is_empty() {
+                    if !generics.params.is_empty() || generics.where_clause.is_some() {
                         return Err("Parametrized traits are not supported yet".to_string());
                     }
 
-                    for bound in param_bounds {
+                    for bound in supertraits {
                         match *bound {
-                            TyParamBound::Trait(ref poly_trait_ref, ref bound_modifier) => {
-                                match *bound_modifier {
+                            TypeParamBound::Trait(TraitBound { ref lifetimes, ref modifier, ref path, .. }) => {
+                                match modifier {
                                     TraitBoundModifier::None => {
-                                        assert!(poly_trait_ref.bound_lifetimes.is_empty());
-                                        let path = &poly_trait_ref.trait_ref;
+                                        assert!(lifetimes.is_none());
 
                                         // Ok, this is plain base trait reference with no lifetimes
                                         // and type bounds. Check whether base trait definition was
@@ -257,7 +280,7 @@ fn generate_mock_for_traits(mock_ident: Ident,
                                     }
                                 }
                             }
-                            TyParamBound::Region(..) => {
+                            TypeParamBound::Lifetime(..) => {
                                 return Err("Lifetime parameter bounds are not supported yet"
                                     .to_string())
                             }
@@ -266,12 +289,12 @@ fn generate_mock_for_traits(mock_ident: Ident,
 
                     let mut trait_path = desc.mod_path.clone();
                     trait_path.segments.push(PathSegment {
-                        ident: desc.trait_item.ident.clone(),
-                        parameters: PathParameters::none(),
+                        ident: ident.clone(),
+                        arguments: PathArguments::None,
                     });
 
                     trait_paths.insert(format!("{:?}", trait_path));
-                    Ok((trait_path, subitems))
+                    Ok((trait_path, items))
                 }
                 _ => {
                     return Err("Only traits are accepted here".to_string());
@@ -285,11 +308,11 @@ fn generate_mock_for_traits(mock_ident: Ident,
     let mut assoc_types = Vec::new();
     for &(_, ref members) in &traits {
         for member in members.iter() {
-            if let TraitItemKind::Type(ref bounds, ref _dflt) = member.node {
+            if let TraitItem::Type(TraitItemType { ref bounds, ref ident, .. }) = member {
                 if !bounds.is_empty() {
                     return Err("associated type bounds are not supported yet".to_string());
                 }
-                assoc_types.push(member.ident.clone());
+                assoc_types.push(ident.clone());
             }
         }
     }
@@ -300,48 +323,44 @@ fn generate_mock_for_traits(mock_ident: Ident,
     // `impl<A: ::std::fmt::Debug, B: ::std::fmt::Debug, ...> ...`.
     let generics = {
         let mut gen = Generics::default();
-        gen.ty_params = assoc_types.iter()
+        gen.params = assoc_types.iter()
             .cloned()
             .map(|param| {
-                let bounds = vec![// nighlty: cx.typarambound(quote_path!(cx, ::std::fmt::Debug)),
-                                  TyParamBound::Trait(PolyTraitRef {
-                                                          bound_lifetimes: vec![],
-                                                          trait_ref: Path {
-                                                              global: true,
-                                                              segments:
-                                                                  vec![PathSegment::from("std"),
-                                                                       PathSegment::from("fmt"),
-                                                                       PathSegment::from("Debug")],
-                                                          },
-                                                      },
-                                                      TraitBoundModifier::None)];
-                TyParam {
+                GenericParam::Type(TypeParam {
+                    colon_token: Some(Token![:]([Span::call_site()])),
+                    eq_token: None,
                     ident: param,
                     attrs: vec![],
-                    bounds: bounds,
+                    bounds: parse_quote! { ::std::fmt::Debug },
                     default: None,
-                }
+                })
             })
             .collect();
         gen
     };
-    // Type of mock struct with all type parameters specified.
-    let struct_type = Ty::Path(None,
-                               Path {
-                                   global: false,
-                                   segments: vec![PathSegment {
+
+    let mut struct_type_path_segments = Punctuated::new();
+
+    struct_type_path_segments.push_value(PathSegment {
                                   ident: mock_ident.clone(),
-                                  parameters:
-                                      PathParameters::AngleBracketed(AngleBracketedParameterData {
-                                      lifetimes: vec![],
-                                      types: assoc_types.iter()
+                                  arguments: PathArguments::AngleBracketed(AngleBracketedGenericArguments {
+                                      colon2_token: Some(Token![::]([Span::call_site(), Span::call_site()])),
+                                      gt_token: Token![>]([Span::call_site()]),
+                                      lt_token: Token![<]([Span::call_site()]),
+                                      args: assoc_types.iter()
                                           .cloned()
-                                          .map(|ident| Ty::Path(None, Path::from(ident)))
+                                          .map(|ident| GenericArgument::Type(Type::Path(TypePath { qself: None, path: Path::from(ident) })))
                                           .collect(),
-                                      bindings: vec![],
                                   }),
-                              }],
-                               });
+                                });
+
+    // Type of mock struct with all type parameters specified.
+    let struct_type = Type::Path(TypePath {
+        qself: None,
+                               path: Path {
+                                   leading_colon: None,
+                                   segments: struct_type_path_segments,
+                               }});
 
     let mut generated_items = vec![struct_item];
 
@@ -350,36 +369,38 @@ fn generate_mock_for_traits(mock_ident: Ident,
         let mut trait_impl_methods = Vec::new();
 
         for member in members.iter() {
-            match member.node {
-                TraitItemKind::Method(ref sig, ref _opt_body) => {
-                    if sig.unsafety != Unsafety::Normal {
+            match member {
+                TraitItem::Method(TraitItemMethod { ref sig, .. }) => {
+                    if sig.unsafety.is_some() {
                         return Err("unsafe trait methods are not supported".to_string());
                     }
-                    if sig.constness != Constness::NotConst {
+                    if sig.constness.is_some() {
                         return Err("const trait methods are not supported".to_string());
                     }
-                    if sig.abi != None
-                    {
+                    if sig.abi.is_some() {
                         return Err("non-Rust ABIs for trait methods are not supported".to_string());
                     }
 
-                    let methods = generate_trait_methods(member.ident.clone(),
+                    let methods = generate_trait_methods(sig.ident.clone(),
                                                          &sig.decl,
-                                                         &sig.generics,
+                                                         &sig.decl.generics,
                                                          &trait_path)?;
                     impl_methods.push(methods.impl_method);
                     trait_impl_methods.push(methods.trait_impl_method);
                 }
-                TraitItemKind::Type(ref bounds, ref _dflt) => {
+                TraitItem::Type(TraitItemType { ref bounds, .. }) => {
                     if !bounds.is_empty() {
                         return Err("associated type bounds are not supported yet".to_string());
                     }
                 }
-                TraitItemKind::Const(..) => {
+                TraitItem::Const(..) => {
                     return Err("trait constants are not supported yet".to_string());
                 }
-                TraitItemKind::Macro(..) => {
+                TraitItem::Macro(..) => {
                     return Err("trait macros are not supported yet".to_string());
+                },
+                TraitItem::Verbatim(..) => {
+                    return Err("syn does not parse this".to_string());
                 }
             }
         }
@@ -395,18 +416,19 @@ fn generate_mock_for_traits(mock_ident: Ident,
         let mut trait_impl_items = trait_impl_methods;
         let trait_type_items =
             assoc_types.iter().cloned().zip(assoc_types.iter().cloned()).map(|(assoc, param)| {
-                let path = Path {
-                    global: false,
-                    segments: vec![PathSegment {
-                                       ident: param,
-                                       parameters: PathParameters::none(),
-                                   }],
-                };
-                ImplItem {
-                    ident: assoc.clone(),
-                    defaultness: Defaultness::Final,
-                    ..mk_implitem(assoc, ImplItemKind::Type(Ty::Path(None, path)))
-                }
+                let path: Path = param.into();
+
+                ImplItem::Type(ImplItemType {
+                    attrs: vec![],
+                    vis: Visibility::Inherited,
+                    defaultness: None,
+                    type_token: Token![type](Span::call_site()),
+                    ident: assoc,
+                    generics: Generics::default(),
+                    eq_token: Token![=]([Span::call_site()]),
+                    ty: Type::Path(TypePath { path, qself: None }),
+                    semi_token: Token![;]([Span::call_site()]),
+                })
             });
         let trait_impl_item = quote!{
             impl #generics #trait_path for #struct_type {
@@ -421,9 +443,9 @@ fn generate_mock_for_traits(mock_ident: Ident,
 
     let mocked_class_name = traits.iter()
         .map(|&(ref path, _)| {
-            let mut tokens = quote::Tokens::new();
-            path.to_tokens(&mut tokens);
-            tokens.to_string()
+            let mut token_stream = TokenStream::new();
+            path.to_tokens(&mut token_stream);
+            token_stream.to_string()
         })
         .join("+");
 
@@ -442,8 +464,8 @@ fn generate_mock_for_traits(mock_ident: Ident,
 
     let has_generic_method =
         Itertools::flatten(traits.iter().map(|&(_, members)| members.iter()))
-        .any(|member| match member.node {
-            TraitItemKind::Method(ref sig, _) => !sig.generics.ty_params.is_empty(),
+        .any(|member| match member {
+            TraitItem::Method(TraitItemMethod { ref sig, .. }) => !sig.decl.generics.params.is_empty(),
             _ => false
         });
     if local && !has_generic_method {
@@ -474,7 +496,7 @@ fn generate_mock_for_traits(mock_ident: Ident,
 /// Associated types of original trait are converted to type parameters.
 /// Since type parameters are unused, we have to use PhantomData for each of them.
 /// We use tuple of |PhantomData| to create just one struct field.
-fn generate_mock_struct(mock_ident: &Ident, associated_type_idents: &[Ident]) -> quote::Tokens {
+fn generate_mock_struct(mock_ident: &Ident, associated_type_idents: &[Ident]) -> TokenStream {
     let phantom_types: Vec<_> = associated_type_idents.iter()
         .map(|ty_param| {
             quote!{ ::std::marker::PhantomData<#ty_param> }
@@ -492,7 +514,7 @@ fn generate_mock_struct(mock_ident: &Ident, associated_type_idents: &[Ident]) ->
 }
 
 fn generate_mock_impl(mock_ident: &Ident, mocked_class_name: &str, associated_type_idents: &[Ident],
-                      custom_init_code: &quote::Tokens) -> quote::Tokens {
+                      custom_init_code: &TokenStream) -> TokenStream {
     let phantom_data_initializers: Vec<_> = associated_type_idents.iter()
         .map(|_| {
             quote!{ ::std::marker::PhantomData }
@@ -517,8 +539,8 @@ fn generate_mock_impl(mock_ident: &Ident, mocked_class_name: &str, associated_ty
 }
 
 struct GeneratedMethods {
-    trait_impl_method: quote::Tokens,
-    impl_method: quote::Tokens,
+    trait_impl_method: TokenStream,
+    impl_method: TokenStream,
 }
 
 fn generate_trait_methods(method_ident: Ident,
@@ -533,7 +555,7 @@ fn generate_trait_methods(method_ident: Ident,
 
     // Arguments without `&self`.
     let self_arg = &decl.inputs[0];
-    let args = &decl.inputs[1..];
+    let args: Vec<_> = decl.inputs.iter().cloned().skip(1).collect();
 
     match *self_arg {
         FnArg::SelfRef(..) |
@@ -546,8 +568,11 @@ fn generate_trait_methods(method_ident: Ident,
     };
 
     let return_type = match decl.output {
-        FunctionRetTy::Default => Ty::Tup(vec![]),
-        FunctionRetTy::Ty(ref ty) => ty.clone(),
+        ReturnType::Default => Box::new(Type::Tuple(TypeTuple {
+                        paren_token: syn::token::Paren::default(),
+                        elems: Punctuated::new(),
+                    })),
+        ReturnType::Type(_, ref ty) => ty.clone(),
     };
 
     let mock_type_id = unsafe {
@@ -560,19 +585,20 @@ fn generate_trait_methods(method_ident: Ident,
                                                        method_ident.clone(),
                                                        generics,
                                                        self_arg,
-                                                       args,
+                                                       &args,
                                                        &return_type);
     let impl_method =
-        generate_impl_method_for_trait(mock_type_id, method_ident, generics, args, &return_type, trait_path);
+        generate_impl_method_for_trait(mock_type_id, method_ident, generics, &args, &return_type, trait_path);
 
-    if let (Ok(tim), Ok(im)) = (trait_impl_method, impl_method) {
+
+    //if let (Ok(tim), Ok(im)) = (trait_impl_method, impl_method) {
         Ok(GeneratedMethods {
-            trait_impl_method: tim,
-            impl_method: im,
+            trait_impl_method: trait_impl_method.expect("trait_impl_method"),
+            impl_method: impl_method.expect("impl_method"),
         })
-    } else {
-        Err("failed to generate impl".to_string())
-    }
+    //} else {
+        //Err("failed to generate impl".to_string())
+    //}
 }
 
 /// Generate mocked trait method implementation for mock struct.
@@ -603,8 +629,8 @@ fn generate_trait_impl_method(mock_type_id: usize,
                               generics: &Generics,
                               self_arg: &FnArg,
                               args: &[FnArg],
-                              return_type: &Ty)
-                              -> Result<quote::Tokens, String> {
+                              return_type: &Type)
+                              -> Result<TokenStream, String> {
     let get_info_expr = quote!{ (self.mock_id, &self.scenario) };
     generate_stub_code(mock_type_id, &method_ident, generics, Some(self_arg), get_info_expr,
                        args, return_type, false)
@@ -614,17 +640,17 @@ fn generate_stub_code(mock_type_id: usize,
                       method_ident: &Ident,
                       generics: &Generics,
                       self_arg: Option<&FnArg>,
-                      get_info_expr: quote::Tokens,
+                      get_info_expr: TokenStream,
                       args: &[FnArg],
-                      return_type: &Ty,
+                      return_type: &Type,
                       is_unsafe: bool)
-                      -> Result<quote::Tokens, String> {
+                      -> Result<TokenStream, String> {
     let method_name = method_ident.to_string();
     // Generate expression returning tuple of all method arguments.
     let arg_values: Vec<Expr> = args.iter()
         .flat_map(|i| {
-            if let &FnArg::Captured(Pat::Ident(_, ref ident, _), _) = i {
-                Some(Expr::from(ExprKind::Path(None, Path::from(ident.clone()))))
+            if let FnArg::Captured(ArgCaptured { pat: Pat::Ident(PatIdent { ref ident, .. }), .. }) = i {
+                Some(Expr::Path(ExprPath { path: Path::from(ident.clone()), attrs: vec![], qself: None }))
             } else {
                 // cx.span_err(i.pat.span, "Only identifiers are accepted in argument list");
                 None
@@ -635,16 +661,19 @@ fn generate_stub_code(mock_type_id: usize,
         return Err("".to_string());
     }
 
-    let verify_fn = Ident::from(format!("verify{}", args.len()));
+    let verify_fn = Ident::new(&format!("verify{}", args.len()), Span::call_site());
 
     let mut impl_args: Vec<FnArg> = args.iter()
         .map(|a| {
             let (ident, ty) = match *a {
-                FnArg::Captured(Pat::Ident(_, ref ident, _), ref ty) => (ident.clone(), ty.clone()),
+                FnArg::Captured(ArgCaptured { ref ty, pat: Pat::Ident(PatIdent { ref ident, .. }), .. }) => (ident.clone(), ty.clone()),
                 _ => panic!("argument pattern"),
             };
-            FnArg::Captured(Pat::Ident(BindingMode::ByValue(Mutability::Mutable), ident, None),
-                            ty)
+            FnArg::Captured(ArgCaptured {
+                pat: Pat::Ident(PatIdent { by_ref: None, mutability: Some(Token![mut](Span::call_site())), ident, subpat: None }),
+                ty,
+                colon_token: Token![:]([Span::call_site()]),
+            })
         })
         .collect();
     if let Some(arg) = self_arg {
@@ -687,9 +716,11 @@ fn generate_impl_method_for_trait(mock_type_id: usize,
                                   method_ident: Ident,
                                   generics: &Generics,
                                   args: &[FnArg],
-                                  return_type: &Ty,
+                                  return_type: &Type,
                                   trait_path: &Path)
-                                  -> Result<quote::Tokens, String> {
+                                  -> Result<TokenStream, String> {
+    use syn::PatPath;
+
     // Types of arguments and resul tmay refer to `Self`, which is ambiguos in the
     // context of trait implementation. All references to `Self` must be replaced
     // with `<Self as Trait>`
@@ -698,7 +729,9 @@ fn generate_impl_method_for_trait(mock_type_id: usize,
         match arg {
             self_arg @ FnArg::SelfRef(..) => self_arg.clone(),
             self_arg @ FnArg::SelfValue(..) => self_arg.clone(),
-            FnArg::Captured(pat, ty) => FnArg::Captured(pat.clone(), qualify_self(ty, trait_path)),
+            // TODO: do inferred arguments have to be qualified too?
+            arg @ FnArg::Inferred(..) => arg.clone(),
+            FnArg::Captured(ArgCaptured { pat, ty, colon_token }) => FnArg::Captured(ArgCaptured { colon_token: colon_token.clone(), pat: pat.clone(), ty: qualify_self(ty, trait_path) }),
             FnArg::Ignored(ty) => FnArg::Ignored(qualify_self(ty, trait_path)),
         }
     }).collect::<Vec<_>>();
@@ -725,17 +758,19 @@ fn generate_impl_method(mock_type_id: usize,
                         method_ident: Ident,
                         generics: &Generics,
                         args: &[FnArg],
-                        return_type: &Ty)
-                        -> Result<quote::Tokens, String> {
+                        return_type: &Type)
+                        -> Result<TokenStream, String> {
+    use syn::Lifetime;
+
     // For each argument generate...
-    let mut arg_matcher_types = Vec::<quote::Tokens>::new();
-    let mut inputs = Vec::<quote::Tokens>::new();
+    let mut arg_matcher_types = Vec::<TokenStream>::new();
+    let mut inputs = Vec::<TokenStream>::new();
 
     // Arguments passed to `CallMatchN::new` method inside mock method body.
-    let mut new_args = Vec::<quote::Tokens>::new();
+    let mut new_args = Vec::<TokenStream>::new();
     new_args.push(quote!{ self.mock_id });
     new_args.push(quote!{ #mock_type_id });
-    let method_name = method_ident.as_ref();
+    let method_name = &method_ident;
     new_args.push(quote!{ #method_name });
 
     // Lifetimes used for reference-type parameters.
@@ -743,12 +778,16 @@ fn generate_impl_method(mock_type_id: usize,
     let mut new_arg_types = Vec::new();
 
     for (i, arg) in args.iter().enumerate() {
-        let (_ident, arg_type) = match *arg {
-            FnArg::Captured(Pat::Ident(_, ref ident, _), ref ty) => (ident.clone(), ty.clone()),
-            _ => unreachable!(),
+        let arg_type = match arg {
+            FnArg::Captured(ArgCaptured { ref ty, .. }) => ty.clone(),
+            FnArg::Ignored(ref ty) => ty.clone(),
+            _ => {
+                println!("{:?}", arg);
+                panic!("unreachable code");
+            },
         };
-        let arg_type_ident = Ident::from(format!("Arg{}Match", i));
-        let arg_ident = Ident::from(format!("arg{}", i));
+        let arg_type_ident = Ident::new(&format!("Arg{}Match", i), Span::call_site());
+        let arg_ident = Ident::new(&format!("arg{}", i), Span::call_site());
 
         // To support reference parameters we must create lifetime parameter for each of them
         // and modify parameter type to adopt new lifetime.
@@ -761,14 +800,14 @@ fn generate_impl_method(mock_type_id: usize,
         // ```
         let new_arg_type = match &arg_type {
             // Parameter is reference
-            &Ty::Rptr(ref _old_lifetime, ref mut_ty) => {
+            Type::Reference(TypeReference { ref elem, ref mutability, .. }) => {
                 // Create separate lifetime.
-                let lifetime = Ident::from(format!("'a{}", i));
-                let lifetime = quote!{ #lifetime };
+                let lifetime = quote!{'a#i};
+
+                //let lifetime = Ident::new(&format!("'a{}", i), Span::call_site());
+                //let lifetime = quote!{ #lifetime };
                 arg_lifetimes.push(lifetime.clone());
-                let mutability = mut_ty.mutability;
-                let ty = &mut_ty.ty;
-                quote!{ &#lifetime #mutability #ty }
+                quote!{ &#lifetime #mutability #elem }
             }
 
             // Parameter is not reference
@@ -784,18 +823,18 @@ fn generate_impl_method(mock_type_id: usize,
         new_args.push(quote!{ Box::new(#arg_ident) });
     }
 
-    let call_match_ident = Ident::from(format!("CallMatch{}", args.len()));
+    let call_match_ident = Ident::new(&format!("CallMatch{}", args.len()), Span::call_site());
 
     let mut call_match_args: Vec<_> = new_arg_types;
     call_match_args.push(quote!{ #return_type });
     let ret_type = quote!{ ::mockers::#call_match_ident<#(#call_match_args),*> };
 
     let output = ret_type.clone();
-    let expect_method_name = Ident::from(format!("{}_call", method_ident));
+    let expect_method_name = Ident::new(&format!("{}_call", method_ident), Span::call_site());
 
-    let debug_param_bound = syn::parse_ty_param_bound("::std::fmt::Debug").unwrap();
+    let debug_param_bound: TypeParamBound = parse_quote!{::std::fmt::Debug};
     let generic_params = [&arg_lifetimes[..],
-                          &generics.ty_params.iter()
+                          &generics.type_params()
                                              .map(|p| {
                                                  let mut p = p.clone();
                                                  p.bounds.push(debug_param_bound.clone());
@@ -804,7 +843,7 @@ fn generate_impl_method(mock_type_id: usize,
                                              .collect::<Vec<_>>()[..],
                           &arg_matcher_types[..]].concat();
 
-    let impl_subitem: quote::Tokens = quote!{
+    let impl_subitem: TokenStream = quote!{
         #[allow(dead_code)]
         pub fn #expect_method_name<#(#generic_params),*>(&self, #(#inputs),*) -> #output {
             ::mockers::#call_match_ident::new(#(#new_args),*)
@@ -815,7 +854,7 @@ fn generate_impl_method(mock_type_id: usize,
 }
 
 
-fn generate_extern_mock(foreign_mod: &syn::ForeignMod, mock_ident: &Ident) -> Result<quote::Tokens, String> {
+fn generate_extern_mock(foreign_mod: &syn::ItemForeignMod, mock_ident: &Ident) -> Result<TokenStream, String> {
     let mock_type_id = unsafe {
         let id = NEXT_MOCK_TYPE_ID;
         NEXT_MOCK_TYPE_ID += 1;
@@ -823,27 +862,32 @@ fn generate_extern_mock(foreign_mod: &syn::ForeignMod, mock_ident: &Ident) -> Re
     };
 
     let (mock_items, stub_items): (Vec<_>, Vec<_>) = foreign_mod.items.iter().map(|item| {
-        match item.node {
-            ForeignItemKind::Fn(ref decl, ref generics) => {
+        match item {
+            ForeignItem::Fn(ForeignItemFn { ref decl, ref ident, .. }) => {
                 let ret_ty = match decl.output {
-                    FunctionRetTy::Ty(ref ty) => ty.clone(),
-                    FunctionRetTy::Default => Ty::Tup(vec![]),
+                    ReturnType::Type(_, ref ty) => ty.clone(),
+                    ReturnType::Default => Box::new(Type::Tuple(TypeTuple {
+                        paren_token: syn::token::Paren::default(),
+                        elems: Punctuated::new(),
+                    })),
                 };
-                let mock_method = generate_impl_method(mock_type_id, item.ident.clone(), &generics, &decl.inputs, &ret_ty)?;
+
+                let inputs: Vec<_> = decl.inputs.clone().into_iter().collect();
+
+                let mock_method = generate_impl_method(mock_type_id, ident.clone(), &decl.generics, &inputs, &ret_ty)?;
 
                 let get_info_expr = quote!{
                     ::mockers::EXTERN_MOCKS.with(|mocks| {
                         mocks.borrow().get(&#mock_type_id).expect("Mock instance not found").clone()
                     })
                 };
-                let stub_method = generate_stub_code(mock_type_id, &item.ident, &generics, None,
-                                                     get_info_expr, &decl.inputs, &ret_ty, true)?;
+
+                let stub_method = generate_stub_code(mock_type_id, &ident, &decl.generics, None,
+                                                     get_info_expr, &inputs, &ret_ty, true)?;
 
                 Ok((mock_method, stub_method))
             },
-
-            ForeignItemKind::Static(..) =>
-                return Err("extern statics are not supported".to_string()),
+            _ => return Err("only functions are supported in extern blocks".to_string()),
         }
     }).collect::<Result<Vec<_>, _>>()?.into_iter().unzip();
 
@@ -894,26 +938,51 @@ fn generate_extern_mock(foreign_mod: &syn::ForeignMod, mock_ident: &Ident) -> Re
 }
 
 /// Replace all unqualified references to `Self` with qualified ones.
-fn qualify_self(ty: &Ty, trait_path: &Path) -> Ty {
-    fn qualify_ty(ty: &Ty, trait_path: &Path) -> Ty {
-        match *ty {
-            Ty::Slice(ref t) => Ty::Slice(Box::new(qualify_ty(&t, trait_path))),
-            Ty::Array(ref t, ref n) => Ty::Array(Box::new(qualify_ty(&t, trait_path)), n.clone()),
-            Ty::Ptr(ref t) => {
-                Ty::Ptr(Box::new(MutTy {
-                    ty: qualify_ty(&t.ty, trait_path),
-                    mutability: t.mutability,
-                }))
+fn qualify_self(ty: &Type, trait_path: &Path) -> Type {
+    use syn::TypeArray;
+
+    fn qualify_ty(ty: &Type, trait_path: &Path) -> Type {
+        match ty {
+            ty @ Type::Verbatim(..) => ty.clone(),
+            Type::Group(ref t) => {
+                let mut clone = t.clone();
+
+                clone.elem = Box::new(qualify_ty(&t.elem, trait_path));
+
+                Type::Group(clone)
+            },
+            Type::Slice(ref type_slice) => {
+                let mut clone = type_slice.clone();
+
+                clone.elem = Box::new(qualify_ty(&type_slice.elem, trait_path));
+
+                Type::Slice(clone)
+            },
+            Type::Array(ref type_arr) => {
+                let mut clone = type_arr.clone();
+
+                clone.elem = Box::new(qualify_ty(&type_arr.elem, trait_path));
+
+                Type::Array(clone)
+            },
+            Type::Ptr(ref type_ptr) => {
+                let mut clone = type_ptr.clone();
+
+                clone.elem = Box::new(qualify_ty(&type_ptr.elem, trait_path));
+
+                Type::Ptr(clone)
             }
-            Ty::Rptr(ref lifetime, ref t) => {
-                Ty::Rptr(lifetime.clone(),
-                         Box::new(MutTy {
-                             ty: qualify_ty(&t.ty, trait_path),
-                             mutability: t.mutability,
-                         }))
+            Type::Reference(ref reference) => {
+                let mut clone = reference.clone();
+
+                clone.elem = Box::new(qualify_ty(&reference.elem, trait_path));
+
+                Type::Reference(clone)
             }
-            Ty::BareFn(ref fnty) => {
-                Ty::BareFn(Box::new(BareFnTy {
+            Type::BareFn(ref fnty) => {
+                Type::BareFn(TypeBareFn {
+                    fn_token: Token![fn](Span::call_site()),
+                    paren_token: syn::token::Paren::default(),
                     unsafety: fnty.unsafety,
                     abi: fnty.abi.clone(),
                     lifetimes: fnty.lifetimes.clone(),
@@ -923,40 +992,63 @@ fn qualify_self(ty: &Ty, trait_path: &Path) -> Ty {
                         .collect(),
                     output: qualify_function_ret_ty(&fnty.output, trait_path),
                     variadic: fnty.variadic,
-                }))
+                })
             }
-            Ty::Never => Ty::Never,
-            Ty::Tup(ref ts) => Ty::Tup(ts.iter().map(|t| qualify_ty(t, trait_path)).collect()),
-            Ty::Path(ref qself, ref path) => {
+            Type::Never(ref type_never) => Type::Never(type_never.clone()),
+            Type::Tuple(ref type_tuple) => {
+                let mut clone = type_tuple.clone();
+
+                clone.elems = type_tuple.elems.iter().map(|t| qualify_ty(t, trait_path)).collect();
+
+                Type::Tuple(clone)
+            },
+            Type::Path(TypePath { ref qself, ref path } ) => {
                 if qself.is_none() &&
-                   path.segments.first().map(|s| s.ident.as_ref() == "Self").unwrap_or(false) {
+                   path.segments.first().map(|s| s.value().ident == "Self").unwrap_or(false) {
                     let self_seg = path.segments.first().unwrap();
-                    let self_ty = Ty::Path(None,
+                    let self_ty = Type::Path(TypePath { qself: None, path:
                                            Path {
-                                               global: false,
-                                               segments: vec![self_seg.clone()],
-                                           });
+                                               leading_colon: None,
+                                               segments: {
+                                                   let mut segments: Punctuated<PathSegment, _> = Punctuated::new();
+
+                                                   segments.push((*self_seg.value()).clone());
+
+                                                   segments
+                                               },
+                                           }});
                     let new_qself = QSelf {
                         ty: Box::new(self_ty),
                         position: trait_path.segments.len(),
+                        as_token: Some(Token![as](Span::call_site())),
+                        gt_token: Token![>]([Span::call_site()]),
+                        lt_token: Token![<]([Span::call_site()]),
                     };
                     let mut new_segments = trait_path.segments.clone();
-                    new_segments.extend_from_slice(&path.segments[1..]);
-                    let a = Ty::Path(Some(new_qself),
-                                     Path {
-                                         global: false,
-                                         segments: new_segments,
-                                     });
+                    new_segments.extend(path.segments.iter().cloned().skip(1));
+                    let a = Type::Path(TypePath {
+                        qself: Some(new_qself),
+                        path: Path {
+                            leading_colon: None,
+                            segments: new_segments,
+                        },
+                    });
                     a
                 } else {
-                    Ty::Path(qself.clone(), qualify_path(&path, trait_path))
+                    Type::Path(TypePath { qself: qself.clone(), path: qualify_path(&path, trait_path) })
                 }
             }
-            ref t @ Ty::TraitObject(..) => t.clone(),
-            Ty::ImplTrait(ref bounds) => Ty::ImplTrait(bounds.clone()),
-            Ty::Paren(ref t) => Ty::Paren(Box::new(qualify_ty(&t, trait_path))),
-            Ty::Infer => Ty::Infer,
-            Ty::Mac(ref mac) => Ty::Mac(mac.clone()),
+            t @ Type::TraitObject(..) => t.clone(),
+            Type::ImplTrait(ref bounds) => Type::ImplTrait(bounds.clone()),
+            Type::Paren(ref t) => {
+                let mut clone = t.clone();
+
+                clone.elem = Box::new(qualify_ty(&t.elem, trait_path));
+
+                Type::Paren(clone)
+            },
+            Type::Infer(ref type_infer) => Type::Infer(type_infer.clone()),
+            Type::Macro(ref mac) => Type::Macro(mac.clone()),
         }
     }
     fn qualify_bare_fn_arg(arg: &BareFnArg, trait_path: &Path) -> BareFnArg {
@@ -965,47 +1057,51 @@ fn qualify_self(ty: &Ty, trait_path: &Path) -> Ty {
             ty: qualify_ty(&arg.ty, trait_path),
         }
     }
-    fn qualify_function_ret_ty(ret_ty: &FunctionRetTy, trait_path: &Path) -> FunctionRetTy {
+    fn qualify_function_ret_ty(ret_ty: &ReturnType, trait_path: &Path) -> ReturnType {
         match *ret_ty {
-            FunctionRetTy::Default => FunctionRetTy::Default,
-            FunctionRetTy::Ty(ref ty) => FunctionRetTy::Ty(qualify_ty(&ty, trait_path)),
+            ReturnType::Default => ReturnType::Default,
+            ReturnType::Type(ref r_arrow, ref ty) => ReturnType::Type(r_arrow.clone(), Box::new(qualify_ty(&ty, trait_path))),
         }
     }
     fn qualify_path(path: &Path, trait_path: &Path) -> Path {
         Path {
-            global: path.global,
+            leading_colon: path.leading_colon.clone(),
             segments: path.segments
                 .iter()
                 .map(|segment| {
                     PathSegment {
                         ident: segment.ident.clone(),
-                        parameters: match segment.parameters {
-                            PathParameters::AngleBracketed(ref data) => {
-                                PathParameters::AngleBracketed(AngleBracketedParameterData {
-                                    lifetimes: data.lifetimes.clone(),
-                                    types: data.types
+                        arguments: match segment.arguments {
+                            PathArguments::None => PathArguments::None,
+                            PathArguments::AngleBracketed(ref data) => {
+                                PathArguments::AngleBracketed(AngleBracketedGenericArguments {
+                                    args: data.args
                                         .iter()
-                                        .map(|t| qualify_ty(t, trait_path))
-                                        .collect(),
-                                    bindings: data.bindings
-                                        .iter()
-                                        .map(|binding| {
-                                            TypeBinding {
-                                                ident: binding.ident.clone(),
-                                                ty: qualify_ty(&binding.ty, trait_path),
+                                        .map(|arg| {
+                                            match arg {
+                                                GenericArgument::Type(ref ty) => GenericArgument::Type(qualify_ty(ty, trait_path)),
+                                                _ => arg.clone(),
                                             }
                                         })
                                         .collect(),
-                                    ..AngleBracketedParameterData::default()
+                                    ..data.clone()
                                 })
                             }
-                            PathParameters::Parenthesized(ref data) => {
-                                PathParameters::Parenthesized(ParenthesizedParameterData {
-                                    inputs: data.inputs
+                            PathArguments::Parenthesized(ParenthesizedGenericArguments { ref inputs, ref output, ref paren_token }) => {
+                                let output = match output {
+                                    ReturnType::Default => ReturnType::Default,
+                                    ReturnType::Type(ref r_arrow, ref ty) => {
+                                        ReturnType::Type(r_arrow.clone(), Box::new(qualify_ty(ty, trait_path)))
+                                    }
+                                };
+
+                                PathArguments::Parenthesized(ParenthesizedGenericArguments {
+                                    paren_token: paren_token.clone(),
+                                    inputs: inputs
                                         .iter()
                                         .map(|i| qualify_ty(i, trait_path))
                                         .collect(),
-                                    output: data.output.as_ref().map(|o| qualify_ty(o, trait_path)),
+                                    output,
                                 })
                             }
                         },
@@ -1018,20 +1114,10 @@ fn qualify_self(ty: &Ty, trait_path: &Path) -> Ty {
     qualify_ty(&ty, trait_path)
 }
 
-fn mk_implitem(ident: Ident, node: ImplItemKind) -> ImplItem {
-    ImplItem {
-        ident: ident,
-        vis: Visibility::Inherited,
-        attrs: vec![],
-        node: node,
-        defaultness: Defaultness::Final,
-    }
-}
-
 #[proc_macro]
-pub fn mock(input: TokenStream) -> TokenStream {
-    match mock_impl(input) {
-        Ok(tokens) => tokens,
+pub fn mock(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    match mock_impl(input.into()) {
+        Ok(tokens) => tokens.into(),
         Err(err) => panic!("{}", err),
     }
 }
@@ -1058,17 +1144,47 @@ fn unwrap<T>(name: &'static str,
 }
 
 fn mock_impl(input: TokenStream) -> Result<TokenStream, String> {
-    use syn::parse::{ident, path, item};
+    use syn::synom::{Synom, PResult};
+    use syn::buffer::Cursor;
+    use syn::Item;
+
+    fn parse_path(i: &str) -> synom::IResult<&'static str, Path> {
+        let buf = TokenBuffer::new2(TokenStream::from_str(i).unwrap());
+        
+        match Path::parse(buf.begin()) {
+            Ok((o, _)) => synom::IResult::Done("", o),
+            Err(_) => synom::IResult::Error,
+        }
+    }
+
+    fn parse_ident(i: &str) -> synom::IResult<&'static str, Ident> {
+        let buf = TokenBuffer::new2(TokenStream::from_str(i).unwrap());
+        
+        match Ident::parse(buf.begin()) {
+            Ok((o, _)) => synom::IResult::Done("", o),
+            Err(_) => synom::IResult::Error,
+        }
+    }
+
+    fn parse_item(i: &str) -> synom::IResult<&'static str, Item> {
+        let buf = TokenBuffer::new2(TokenStream::from_str(i).unwrap());
+        
+        match Item::parse(buf.begin()) {
+            Ok((o, _)) => synom::IResult::Done("", o),
+            Err(_) => synom::IResult::Error,
+        }
+    }
+
     named!(mock_args -> (Ident, Vec<TraitDesc>), do_parse!(
-        ident: ident >>
+        ident: parse_ident >>
         punct!(",") >>
         traits: separated_list!(punct!(","), do_parse!(
             path: alt!(
-                map!(keyword!("self"), |_| Path { global: false, segments: vec![] })
-                | path
+                map!(keyword!("self"), |_| Path { leading_colon: None, segments: Punctuated::default() })
+                | parse_path
             ) >>
             punct!(",") >>
-            trait_item: item >>
+            trait_item: parse_item >>
             (TraitDesc { mod_path: path, trait_item: trait_item })
         )) >>
         (ident, traits)
@@ -1082,5 +1198,5 @@ fn mock_impl(input: TokenStream) -> Result<TokenStream, String> {
         println!("{}", tokens.to_string());
     }
 
-    Ok(tokens.parse().unwrap())
+    Ok(TokenStream::from(tokens))
 }
